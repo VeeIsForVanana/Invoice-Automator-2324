@@ -1,0 +1,377 @@
+// use this pre-filled response to test https://docs.google.com/forms/d/e/1FAIpQLSdzfXLKU6glQUmuUs2DWUQZa3FVRgrPIHUYDP3j7S0CYGH99g/viewform?edit2=2_ABaOnucjpkYnF-A7rEzDXB_VhaXmiwYgHqVpiL5xwtp493od-1EbU1eRUW-oHlfnM3jV0K0
+
+// TODO: rewrite in TypeScript because fuck vanilla JS
+
+// run whenever a submission event is detected, and accept the event itself
+
+import GForms = GoogleAppsScript.Forms;
+import Events = GoogleAppsScript.Events;
+import GSheets = GoogleAppsScript.Spreadsheet;
+import Base = GoogleAppsScript.Base;
+import GDocs = GoogleAppsScript.Document;
+import GDrive = GoogleAppsScript.Drive;
+import GMail = GoogleAppsScript.Gmail;
+
+const TEMPLATE_DIRECTORY_ID = "1WHtjmtzy7E1_GLnrqq0UNeIqeQRinSBw"; // ID for the parent directory, will need to be configured with every move
+const PRINT_DIRECTORY_NAME = "Invoices"
+const PDF_DIRECTORY_NAME = "Invoice PDFs"
+const TEMPLATE_DOCS_ID = "1a81BScK-XEVyvuBtXeJbNgnKZ_3QMdyZdsiXDPMTDBs";
+
+/* 
+  for standardization purposes, let it be understood that template modifiers are best used to dictate the *formatting* of the output.
+  adding additional content, or constructing new strings that rely on more than one template ID are best done through specialProcessing 
+    and directly modifying the templateIDDict 
+  further let it be noted that as of current version, modifiers do not support altering the actual GDocs text formatting, their main purpose is controlling how actual data
+    is rendered into text (e.g. dates into MM/DD/YYYY format or internationalized format)
+*/
+const MODIFIER_DICT = {
+  undefined: (text:string) => text,
+  null: (text: string) => text,
+  "PHP": (value: number) => value >= 0 ? `PHP ${value}` : `(PHP ${value})`,
+  "DeleteRowOnEmpty": (text: string) => `${(text == '') ? "DELETE-MY-ROW" : text}`,
+  "DateMDY": (value: Date) => `${String(value.getMonth() + 1).padEnd(2, "0")}/${String(value.getDate()).padStart(2, "0")}/${value.getFullYear()}`,
+  "EndlineBefore": (text: string) => `\n${text}`,
+  "EndlineAfter": (text: string) => `${text}\n`,
+}
+
+type stringParsingFunction<T> = (T) => string; 
+
+// encapsulates a template area in a template document, including the template ID, its modifier string, the corresponding modifier function to build the full text, and the text
+class TemplateSpace {
+
+  private _id: string;
+  private modifiers: Array<string>;
+  private modifierFunctions: Array<stringParsingFunction<string> | stringParsingFunction<Date>>;
+  private _text: string;
+  private _debugText: string;
+
+  constructor(
+    private _idWithModifier: string,
+  ) {
+    let idModifierArray = this._idWithModifier.split("~"); // DO NOT USE SPECIAL REGEX CHARACTERS AS DELIMITERS !!! Similarly, do not use them as template IDs or really anything that'll appear in a template space aside from its actual replacement text
+    this._id = idModifierArray[0];
+    this.modifiers = idModifierArray.slice(1);
+    this.modifierFunctions = this.modifiers.map((elem: string) => (MODIFIER_DICT[elem]));
+  }
+  
+  // parse value text through the modifier function and use it as the object's text
+  public parseText(text: string): string {
+    this._debugText = text;
+    this._text = text;
+    for(let parser of this.modifierFunctions) {
+      this._text = parser(this.text);
+    }
+    return this._text;
+  }
+
+  // forces this.text to value text without passing through the modifier, used for when we want to see the original _debugText
+  public forceParseText(text: string): string {
+    this._text = text;
+    return this._text;
+  }
+
+  public get id() {return this._id;}
+  public get idWithModifier() {return this._idWithModifier;}
+  public get text() {return this._text;}
+  public get debugText() {return this._debugText;}
+}
+
+// START HERE!
+function onSubmit(event: GoogleAppsScript.Events.FormsOnFormSubmit) {
+  let sourceForm: GForms.Form = event.source; // a Form object representing the form itself (the source of the event)
+  let responseObject: GForms.FormResponse = event.response; // a FormResponse object from the submission event
+  let responseTime: Base.Date = responseObject.getTimestamp(); // we need the timestamp of the submission in order to identify it in the GSheets in the case of edited submissions, etc.
+
+  // build a list and dict encapsulating the header rows of the spreadsheet (to be used as template IDs) and a dict linking header items to response items
+  let builtTemplateIDTuple: Array<any> = buildTemplateIDDict(sourceForm.getDestinationType() == FormApp.DestinationType.SPREADSHEET ? sourceForm.getDestinationId() : raiseException("No spreadsheet to build dict from"));
+  let templateIDList: Array<string> = builtTemplateIDTuple[0];
+  let templateIDDict: {} = builtTemplateIDTuple[1];
+
+  templateIDDict = fillTemplateIDDict(sourceForm.getDestinationId(), templateIDDict, templateIDList, responseTime);
+  templateIDDict = specialProcessing(templateIDDict);
+
+  // TODO: build the document itself from a template (note the convention: a 'print' is generated by filling in a 'template')
+
+  let printDocObject = makePrintDocs(TEMPLATE_DOCS_ID);
+  printDocObject = setupPrintDocs(printDocObject, buildDocName(templateIDDict, '[INVOICE] - ', ["Formal Company Name"], '_UP CAPES 2324'));
+  printDocObject = fillPrintDocs(printDocObject, templateIDDict);
+
+  // TODO: build an email message and send it off to the email address recorded by the template IDs
+
+  printDocObject.saveAndClose();
+
+  let printPDFObject = makePrintPDF(printDocObject.getId());
+
+  printPDFObject.addViewer(templateIDDict["Email Address"]);
+  printDocObject.addEditor(templateIDDict["Email Address"]);
+
+  sendEmail(templateIDDict["Email Address"], printPDFObject.getId(), printDocObject.getId(), templateIDDict["Formal Company Name"], templateIDDict["Name of Marketer"]);
+}
+
+// HELPERS INVOLVED IN BUILDING TEMPLATE ID
+
+// retrieve the headers from the spreadsheet at spreadsheetID (which should be preset to correspond to the templates to be filled with the corresponding entries) and return as a dict and a list
+function buildTemplateIDDict(spreadsheetID: String | void): [Array<string>, {}] {
+  let responseSheet = retrieveResponseSheet(spreadsheetID)
+  let headerRange = responseSheet.getRange(1, 1, 1, responseSheet.getLastColumn()); // get a range for the header row of the spreadsheet (again, there SHOULD be one pre-set)
+  let headerValues = headerRange.getValues();
+  let templateIDList = new Array<string>();
+  let templateIDDict = {};
+  // add all elements of the header row to the idList and to the idDict as keys
+  headerValues[0].forEach((elem) => {
+    templateIDList.push(elem);
+    templateIDDict[elem] = "";
+  });
+
+  return [templateIDList, templateIDDict];
+}
+
+// mutates the templateDict and sets the values for keys to their corresponding values according to the response by first searching for the timestamp corresponding to the response
+function fillTemplateIDDict(spreadsheetID: String, templateIDDict: {}, templateIDList: Array<string>, dateObject: Base.Date): {} {
+  let responseSheet = retrieveResponseSheet(spreadsheetID);
+  let responseRowRange: GSheets.Range = findSheetRowByKey(responseSheet, dateObject, isSameDaySameTime);
+  // assign the templateIDDict value for a given key from iterating over the templateIDList
+  for(let i = 0; i < responseRowRange.getNumColumns(); i++) {
+    templateIDDict[templateIDList[i]] = responseRowRange.getValues()[0][i];
+  }
+
+  return templateIDDict;
+}
+
+// returns a row of a sheet as a range identified by the value of its first column (key) using the comparatorFunction
+function findSheetRowByKey(sheetObject, key, comparatorFunction): GSheets.Range | never {
+
+  // start search at second row because we assume first row is headers not of the same datatype as our key (in which case our comparator function would error)
+  for(let i = 2; i <= sheetObject.getLastRow(); i ++) {
+
+    if(comparatorFunction(sheetObject.getRange(i, 1).getValue(), key)) {
+      return sheetObject.getRange(i, 1, i, sheetObject.getLastColumn());
+    } 
+  }
+  raiseException(`The key ${key} was not found in key position for the sheet with ID ${sheetObject.getSheetId()}`);
+}
+
+// roughly compare two date objects, check for equality
+function isSameDaySameTime(datetime1: Base.Date, datetime2: Base.Date) {
+  return datetime1.valueOf() === datetime2.valueOf();
+}
+
+// helper function that throws errors for me because i definitely didn't forget i could just go "throw new Error(error_message)"
+function raiseException(error_message): never {
+  throw new Error(error_message);
+}
+
+// retrieves the Sheet object (which we expect to hold all the responses) referenced by the given spreadsheetID
+function retrieveResponseSheet(spreadsheetID) {
+  return SpreadsheetApp.openById(spreadsheetID).getActiveSheet();
+}
+
+// takes a Date object and returns a string representing it the same way GSheets formats dates (VERY PRONE TO ERROR, NEEDS TESTING ON DIFFERENT DATES)
+function gSheetsTimeStringBuilder(timestamp) {
+  return `${timestamp.getMonth() + 1}/${String(timestamp.getDate()).padStart(2, '0')}/${timestamp.getFullYear()} ${timestamp.getHours()}:${String(timestamp.getMinutes()).padStart(2, '0')}:${String(timestamp.getSeconds()).padStart(2, '0')}`;
+}
+
+// does special processing unique to this scenario (e.g. sum of discounts + amounts = total)
+function specialProcessing(templateIDDict: Object) {
+  
+  // calculate total amount of currency
+  let total = 0;
+
+  // calculate amount for rate, quantity, discount, amount, etc of row
+  for(let i of [1, 2, 3, 4, 5]) {
+    let discount: boolean = templateIDDict[`Is this a discount?`] == "Yes";
+    let rate = Number(templateIDDict[`Rate #${i}`]) * (discount? -1 : 1); // check if discounted, if yes negative else positive
+    let quant = templateIDDict[`Quantity #${i}`]
+    let vat = templateIDDict[`VAT #${i}`] == "" ? Number(rate) * 0.12 : templateIDDict[`VAT #${i}`]; // assume VAT will either be manually entered or set to 12% of rate
+    let amt: number = Number(rate) * Number(quant);
+    
+    total += amt;
+
+    templateIDDict[`Rate #${i}`] = rate;
+    templateIDDict[`VAT #${i}`] = vat;
+    templateIDDict[`Amount #${i}`] = amt;
+  }
+
+  templateIDDict[`Total`] = total;
+
+  // build invoice number string by checking for participation in events
+  let evtParticipation: string = templateIDDict["Event Participation"];
+  let evtParticipationString = evtParticipation.split(", ").map((elem) => elem[0]).join(""); // split the string into comma-delimited parts, then take the first letters and stick them back together
+  let invoiceString = `2324-${templateIDDict["Formal Company Name"]}-${evtParticipationString}`;
+  templateIDDict[`Invoice Number`] = invoiceString;
+
+  return templateIDDict;
+}
+
+// HELPERS INVOLVED IN CREATING PRINT DOCUMENT
+
+// makes a copy of the template and returns it (the print) as a GDocs.Document object
+function makePrintDocs(templateDocsID: string): GDocs.Document {
+  let templateDocs = DriveApp.getFileById(templateDocsID);
+  let templateFolder = DriveApp.getFolderById(TEMPLATE_DIRECTORY_ID);
+  
+  // check if invoice prints folder exists yet, create if not
+  if(templateFolder.getFoldersByName(PRINT_DIRECTORY_NAME).hasNext() == false) {
+    templateFolder.createFolder(PRINT_DIRECTORY_NAME);
+  }
+
+  let printFolder = templateFolder.getFoldersByName(PRINT_DIRECTORY_NAME).next();
+
+  let printFileID = templateDocs.makeCopy(printFolder).getId();
+  return DocumentApp.openById(printFileID);
+}
+
+// creates the document name as a string built as follows `${nonVariantStart}${templateIDDict[variantsID[0]], templateIDDict[variantsID[1]], ...}${nonVariantEnd}`
+function buildDocName(templateIDDict: Object, nonVariantStart: string, variantsID: Array<string>, nonVariantEnd: string): string {
+  return `${nonVariantStart}${variantsID.map(elem => templateIDDict[elem]).join(' - ')}${nonVariantEnd}`;
+}
+
+// sets the name and whatever other metadata (as of writing i dont know what else you would actually set) for the print, then returns the Document
+function setupPrintDocs(printDocObject: GDocs.Document, printDocName: string): GDocs.Document {
+  return printDocObject.setName(printDocName);
+}
+
+// this is the fun part
+function fillPrintDocs(printDocObject: GDocs.Document, templateIDDict: Object): GDocs.Document {
+  let printBody = printDocObject.getBody()
+  
+  let templateSpaceArray = retrieveAllTemplateSpacesFromBody(printBody);
+  templateSpaceArray = fillTemplateSpaces(templateSpaceArray, templateIDDict);
+  replaceTemplateSpaces(templateSpaceArray, printBody);
+  handleDeletables(printBody);
+
+  return printDocObject;
+}
+
+// accepts a body element of a template and returns an array of all template spaces found in the template
+function retrieveAllTemplateSpacesFromBody(printBody: GDocs.Body): Array<TemplateSpace> {
+  let templateSpaceArray: Array<TemplateSpace> = [];
+  let nextSearchElement: GDocs.RangeElement | null = null
+  
+  // search document for all text matching the template pattern and build template spaces until there are no template spaces left
+  do {
+    if(nextSearchElement == null ) {nextSearchElement = printBody.findText("<<.*>>");}
+    else {nextSearchElement = printBody.findText("<<.*>>", nextSearchElement);}
+
+    if(nextSearchElement == null) {break;}
+
+    let currentElement : GDocs.Element = nextSearchElement.getElement();
+    let templateText = currentElement.asText().getText(); // what the fuck google
+
+    let matchTemplates: RegExp = /<<.*>>/gi;
+    let matchingText: Array<string> | null = templateText.match(matchTemplates);
+    
+    if(matchingText == null) {raiseException("REGEX matching of templates doesn't make sense")}
+    else {
+      for(let match of matchingText) {
+        let templateSpace = new TemplateSpace(match.slice(2, -2));
+
+        templateSpaceArray.push(templateSpace);
+      }
+    }
+
+  } while(true)
+
+  return templateSpaceArray;
+}
+
+// fill template space *objects* with their corresponding parsed values by ID and modifier
+function fillTemplateSpaces(templateSpaceArray: Array<TemplateSpace>, templateIDDict: Object): Array<TemplateSpace> {
+  for(let templateSpace of templateSpaceArray) {
+    let nullCheck = templateSpace.parseText(templateIDDict[templateSpace.id]);
+    if(nullCheck == "") {
+      templateSpace.forceParseText("NULL TEXT");
+    }
+    else if(nullCheck == undefined) {
+      templateSpace.forceParseText("UNDEFINED TEXT");
+      // raiseException(`Attempting to parse ${templateSpace.id} in templateSpaceArray yielded undefined (actual value: ${templateSpace.debugText})`)
+    }
+    console.log(templateSpace)
+  }
+
+  return templateSpaceArray;
+}
+
+// fill all template spaces in text with their corresponding value
+function replaceTemplateSpaces(templateSpaceArray: Array<TemplateSpace>, printBody: GDocs.Body) {
+  for(let templateSpace of templateSpaceArray) {
+    
+    console.log(`Replacing ${templateSpace.idWithModifier} with ${templateSpace.text}`);
+    printBody.replaceText(`<<${templateSpace.idWithModifier}>>`, templateSpace.text);
+  }
+}
+
+// handle the deletion of marked elements
+function handleDeletables(printBody: GDocs.Body) {
+  let tables = printBody.getTables();
+
+  // handle deletion of tables and table elements
+  for(let table of tables) {
+    
+    let deleteRowsArray: Array<number> = []
+
+    // in theory there should be something before this row-checker to see if the entire table is deletable based on a condition
+    for(let row = 0; row < table.getNumRows(); row++) {
+      let currentRow = table.getRow(row);
+
+      // checks if row is deletable
+      if(isRowDeletable(currentRow)) {
+        deleteRowsArray.push(row);
+        console.log(`adding row number ${row} to deletables`)
+      }
+
+    }
+
+    // delete rows in reverse, *after we've identified all deletables* or else we'll have mis-indexing
+    for(let row of deleteRowsArray.reverse()) {
+      table.removeRow(row);
+    }
+
+  }
+}
+
+function isRowDeletable(row: GDocs.TableRow): boolean {
+  if(row.getCell(0).getText() == "DELETE-MY-ROW") {
+    return true;
+  }
+  return false
+}
+
+// HELPERS INVOLVED IN EMAILING PRINT DOCUMENT
+
+function makePrintPDF(printDocsID: string): GDrive.File {
+  let printDocsObject = DriveApp.getFileById(printDocsID);
+  let templateFolder = DriveApp.getFolderById(TEMPLATE_DIRECTORY_ID);
+  
+  // check if invoice prints folder exists yet, create if not
+  if(templateFolder.getFoldersByName(PDF_DIRECTORY_NAME).hasNext() == false) {
+    templateFolder.createFolder(PDF_DIRECTORY_NAME);
+  }
+
+  let pdfFolder = templateFolder.getFoldersByName(PDF_DIRECTORY_NAME).next();
+
+  DocumentApp.openById(printDocsID).saveAndClose();
+
+  let pdfBlob = DriveApp.getFileById(printDocsID).getAs('application/pdf');
+  let pdfFileID = pdfFolder.createFile(pdfBlob).getId();
+
+  return DriveApp.getFileById(pdfFileID);
+}
+
+function sendEmail(targetEmail: string, pdfID: string, docsID: string, companyName: string, marketerName: string) {
+  let options = {
+    attachments: [DriveApp.getFileById(pdfID)]
+  }
+
+  let subject = `UP CAPES 2324 Invoice - ${companyName}`;
+  let body = '<p>Hi ' + marketerName + ',</p><p>Attached is the Invoice for ' + companyName
+  + '. Kindly review the document carefully before affixing your signature. Once verified by your !VERIFIER!, send it to' 
+  + ' your Discord Team channel and mention !SIGNATORIES! for !THEIR! signature.'
+  + '</p><p>You may access the PDF version through the attachment below' 
+  + '. If you want to edit the file, you may access the docs'
+  + ' version through this URL: ' + DriveApp.getFileById(docsID).getUrl()
+  + '. </p><p>For any questions, don\'t hesitate to ask any of the !ADVISERS!.'
+  + '</p><p>Thank you!</p><p>-!CLOSING LINE!</p>';
+  
+  GmailApp.sendEmail(targetEmail, subject, body, options);
+}
