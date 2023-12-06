@@ -1,6 +1,6 @@
 import { GForms, Events, GSheets, Base, GDocs, GDrive, GMail } from "./general.ts";
 import { TEMPLATE_DIRECTORY_ID, PRINT_DIRECTORY_NAME } from "./general.ts";
-import { raiseException } from "./retrieval";
+import * as retrieval from "./retrieval";
 
 /*
   for standardization purposes, let it be understood that template modifiers are best used to dictate the *formatting* of the output.
@@ -113,7 +113,7 @@ function retrieveAllTemplateSpacesFromBody(printBody: GDocs.Body): Array<Templat
         let matchTemplates: RegExp = /<<.*>>/gi;
         let matchingText: Array<string> | null = templateText.match(matchTemplates);
 
-        if (matchingText == null) { raiseException("REGEX matching of templates doesn't make sense"); }
+        if (matchingText == null) { retrieval.raiseException("REGEX matching of templates doesn't make sense"); }
         else {
             for (let match of matchingText) {
                 let templateSpace = new TemplateSpace(match.slice(2, -2));
