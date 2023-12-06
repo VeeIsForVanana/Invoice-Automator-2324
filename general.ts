@@ -13,3 +13,4 @@ export const TEMPLATE_DIRECTORY_ID = "1WHtjmtzy7E1_GLnrqq0UNeIqeQRinSBw"; // ID 
 export const PRINT_DIRECTORY_NAME = "Invoices";
 export const PDF_DIRECTORY_NAME = "Invoice PDFs";
 export const TEMPLATE_DOCS_ID = "1a81BScK-XEVyvuBtXeJbNgnKZ_3QMdyZdsiXDPMTDBs";
+export const YEAR_CODE = "2324"

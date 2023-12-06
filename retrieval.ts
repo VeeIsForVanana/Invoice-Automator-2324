@@ -1,4 +1,4 @@
-import { GForms, Events, GSheets, Base, GDocs, GDrive, GMail } from "./general.ts";
+import { GForms, Events, GSheets, Base, GDocs, GDrive, GMail, YEAR_CODE } from "./general.ts";
 
 // HELPERS INVOLVED IN BUILDING TEMPLATE ID
 // retrieve the headers from the spreadsheet at spreadsheetID (which should be preset to correspond to the templates to be filled with the corresponding entries) and return as a dict and a list
@@ -81,7 +81,7 @@ export function specialProcessing(templateIDDict: Object) {
   // build invoice number string by checking for participation in events
   let evtParticipation: string = templateIDDict["Event Participation"];
   let evtParticipationString = evtParticipation.split(", ").map((elem) => elem[0]).join(""); // split the string into comma-delimited parts, then take the first letters and stick them back together
-  let invoiceString = `2324-${templateIDDict["Formal Company Name"]}-${evtParticipationString}`;
+  let invoiceString = `${YEAR_CODE}-${templateIDDict["Formal Company Name"]}-${evtParticipationString}`;
   templateIDDict[`Invoice Number`] = invoiceString;
 
   return templateIDDict;

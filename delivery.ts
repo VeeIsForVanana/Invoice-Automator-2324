@@ -1,5 +1,5 @@
 import { GForms, Events, GSheets, Base, GDocs, GDrive, GMail } from "./general.ts";
-import { TEMPLATE_DIRECTORY_ID, PDF_DIRECTORY_NAME } from "./general.ts";
+import { TEMPLATE_DIRECTORY_ID, PDF_DIRECTORY_NAME, YEAR_CODE } from "./general.ts";
 
 
 // HELPERS INVOLVED IN EMAILING PRINT DOCUMENT
@@ -26,7 +26,7 @@ export function sendEmail(targetEmail: string, pdfID: string, docsID: string, co
         attachments: [DriveApp.getFileById(pdfID)]
     };
 
-    let subject = `UP CAPES 2324 Invoice - ${companyName}`;
+    let subject = `UP CAPES ${YEAR_CODE} Invoice - ${companyName}`;
     let body = '<p>Hi ' + marketerName + ',</p><p>Attached is the Invoice for ' + companyName
         + '. Kindly review the document carefully before affixing your signature. Once verified by your !VERIFIER!, send it to'
         + ' your Discord Team channel and mention !SIGNATORIES! for !THEIR! signature.'
